@@ -1,9 +1,9 @@
 {
 	"format": 1,
 	"id": "k1ngop.valid-user",
-	"name": "ValidUser",
+	"name": "hahahaha",
 	"description": "Fixes unresolved user mentions like @unknown-user to a normal clickable mention.",
-	"author": "k1ng_op",
+	"author": "21aansell-sketch",
 	"version": "1.0.0",
 	"icon": "ic_mention_24px",
 	"dependencies": {
