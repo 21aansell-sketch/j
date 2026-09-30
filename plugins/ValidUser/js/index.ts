@@ -1,361 +1,1170 @@
+/*
+ * Local Message Edit
+ *
+ * Revenge Next / Discord Android
+ *
+ * Lets you long-press another person's message and choose
+ * "Edit Locally".
+ *
+ * The edit is LOCAL ONLY.
+ *
+ * It does NOT call Discord's message-edit endpoint.
+ * Other Discord users continue seeing the original message.
+ */
+
 const { lookupModule, waitForModules } = revenge.modules.finders;
 const { filters } = revenge.modules.finders;
 const { patcher } = revenge;
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const mods: Record<string, any> = {};
 
-const MENTION_REGEX = /<@!?(\d{17,19})>/g;
-const COMPONENTS_V2_FLAG = 1 << 15;
-const DEFAULT_EMBED_COLOR = 1974050;
-const GATEWAY_OP_REQUEST_MEMBERS = 8;
-const BULK_FETCH_THRESHOLD = 5;
+/* ============================================================
+ * STORAGE
+ * ============================================================
+ */
 
-const deletedUserPayload = (userId) => ({
-	id: userId,
-	username: "Deleted User",
-	global_name: null,
-	globalName: null,
-	discriminator: "0000",
-	avatar: null,
-	avatarDecorationData: null,
-	bot: false,
-	system: false,
-	flags: 0,
-	publicFlags: 0,
-	public_flags: 0,
-	guildMemberAvatars: {},
-});
+const edits: Record<string, string> = {};
 
-const idsFromText = (text, isCached) =>
-	!text ? [] : [...text.matchAll(MENTION_REGEX)].map((m) => m[1]).filter((id) => !isCached(id));
-
-function idsFromComponents(components, isCached) {
-	const ids = [];
-	if (!Array.isArray(components)) return ids;
-	for (const c of components) {
-		if (!c) continue;
-		if (c.type === 10 || typeof c.content === "string") ids.push(...idsFromText(c.content, isCached));
-		if (Array.isArray(c.components)) ids.push(...idsFromComponents(c.components, isCached));
-	}
-	return ids;
+function messageKey(message: any): string {
+    return `${message?.channel_id ?? message?.channelId ?? ""}:${message?.id ?? ""}`;
 }
 
-function allMentionIds(message, isCached) {
-	const ids = [];
-	if (message.content) ids.push(...idsFromText(message.content, isCached));
-
-	for (const embed of message.embeds ?? []) {
-		if (embed.rawTitle) ids.push(...idsFromText(embed.rawTitle, isCached));
-		if (embed.rawDescription) ids.push(...idsFromText(embed.rawDescription, isCached));
-		for (const field of embed.fields ?? []) {
-			if (field.rawName) ids.push(...idsFromText(field.rawName, isCached));
-			if (field.rawValue) ids.push(...idsFromText(field.rawValue, isCached));
-		}
-	}
-
-	ids.push(...idsFromComponents(message.components, isCached));
-
-	for (const snapshot of message.messageSnapshots ?? []) {
-		const snap = snapshot.message;
-		if (!snap) continue;
-		if (snap.content) ids.push(...idsFromText(snap.content, isCached));
-		for (const embed of snap.embeds ?? []) {
-			if (embed.rawTitle) ids.push(...idsFromText(embed.rawTitle, isCached));
-			if (embed.rawDescription) ids.push(...idsFromText(embed.rawDescription, isCached));
-		}
-		ids.push(...idsFromComponents(snap.components, isCached));
-	}
-
-	return [...new Set(ids)];
+function getEdit(message: any): string | undefined {
+    return edits[messageKey(message)];
 }
 
-function bustComponentsCache(components) {
-	const clone = JSON.parse(JSON.stringify(components ?? []));
-	function touch(nodes) {
-		for (const node of nodes) {
-			if (!node) continue;
-			if (node.type === 10 || typeof node.content === "string") {
-				node.content = `${node.content}\u200b`;
-				return true;
-			}
-			if (Array.isArray(node.components) && touch(node.components)) return true;
-		}
-		return false;
-	}
-	touch(clone);
-	return clone;
+function hasEdit(message: any): boolean {
+    return Object.prototype.hasOwnProperty.call(
+        edits,
+        messageKey(message),
+    );
 }
 
-function hslaToInt(hsla) {
-	const m = hsla.match(/^hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*(?:,\s*[\d.]+\s*)?\)$/i);
-	if (!m) return DEFAULT_EMBED_COLOR;
-
-	const h = Number.parseFloat(m[1]) / 360;
-	const s = Number.parseFloat(m[2]) / 100;
-	const l = Number.parseFloat(m[3]) / 100;
-
-	if (s === 0) {
-		const gray = Math.round(l * 255);
-		return (gray << 16) | (gray << 8) | gray;
-	}
-
-	const hue = (p, q, t) => {
-		if (t < 0) t += 1;
-		if (t > 1) t -= 1;
-		if (t < 1 / 6) return p + (q - p) * 6 * t;
-		if (t < 1 / 2) return q;
-		if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-		return p;
-	};
-
-	const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-	const p = 2 * l - q;
-	const r = Math.round(hue(p, q, h + 1 / 3) * 255);
-	const g = Math.round(hue(p, q, h) * 255);
-	const b = Math.round(hue(p, q, h - 1 / 3) * 255);
-	return (r << 16) | (g << 8) | b;
+function setEdit(message: any, content: string) {
+    edits[messageKey(message)] = content;
 }
 
-const embedColor = (color) =>
-	typeof color === "number" ? color : typeof color === "string" && color.startsWith("hsl") ? hslaToInt(color) : DEFAULT_EMBED_COLOR;
-
-function toRawEmbed(embed) {
-	if (!embed) return embed;
-	const raw = {
-		type: embed.type,
-		url: embed.url,
-		color: embedColor(embed.color),
-		timestamp: embed.timestamp,
-		title: embed.rawTitle ?? (typeof embed.title === "string" ? embed.title : undefined),
-		description: embed.rawDescription ?? (typeof embed.description === "string" ? embed.description : undefined),
-		author: embed.author && {
-			name: embed.author.name,
-			url: embed.author.url,
-			icon_url: embed.author.iconURL ?? embed.author.icon_url,
-			proxy_icon_url: embed.author.iconProxyURL ?? embed.author.proxy_icon_url,
-		},
-		image: embed.image && {
-			url: embed.image.url,
-			proxy_url: embed.image.proxyURL,
-			width: embed.image.width,
-			height: embed.image.height,
-		},
-		thumbnail: embed.thumbnail && {
-			url: embed.thumbnail.url,
-			proxy_url: embed.thumbnail.proxyURL,
-			width: embed.thumbnail.width,
-			height: embed.thumbnail.height,
-		},
-		video: embed.video,
-		provider: embed.provider,
-		footer: embed.footer && {
-			icon_url: embed.footer.iconURL ?? embed.footer.icon_url,
-			proxy_icon_url: embed.footer.iconProxyURL ?? embed.footer.proxy_icon_url,
-			...embed.footer,
-		},
-	};
-	if (Array.isArray(embed.fields)) {
-		raw.fields = embed.fields.map((f) => ({
-			name: f.rawName ?? (typeof f.name === "string" ? f.name : ""),
-			value: f.rawValue ?? (typeof f.value === "string" ? f.value : ""),
-			inline: f.inline,
-		}));
-	}
-	return raw;
+function clearEdit(message: any) {
+    delete edits[messageKey(message)];
 }
 
-const isComponentsV2 = (flags) => typeof flags === "number" && (flags & COMPONENTS_V2_FLAG) === COMPONENTS_V2_FLAG;
 
-let mods = {};
+/* ============================================================
+ * MODULE LOOKUP
+ * ============================================================
+ */
 
-function resolve(cleanup, name, filter, onFound) {
-	const [found] = lookupModule(filter);
-	if (found) {
-		mods[name] = found;
-		onFound?.(found);
-		return;
-	}
-	const stop = waitForModules(filter, (exports) => {
-		stop();
-		mods[name] = exports;
-		onFound?.(exports);
-	});
-	cleanup(stop);
+function findModules() {
+    const [UserStore] = lookupModule(
+        filters.withProps(
+            "getUser",
+            "getCurrentUser",
+        ),
+    );
+
+    const [MessageStore] = lookupModule(
+        filters.withProps(
+            "getMessages",
+        ),
+    );
+
+    /*
+     * Discord's ActionSheet implementation.
+     *
+     * These properties are intentionally looked up rather than
+     * importing Discord internals directly because Discord's
+     * internal module paths change between versions.
+     */
+    const [ActionSheet] = lookupModule(
+        filters.withProps(
+            "openLazy",
+            "hideActionSheet",
+        ),
+    );
+
+    mods.UserStore = UserStore;
+    mods.MessageStore = MessageStore;
+    mods.ActionSheet = ActionSheet;
+
+    return (
+        !!mods.UserStore &&
+        !!mods.MessageStore &&
+        !!mods.ActionSheet
+    );
 }
+
+
+/* ============================================================
+ * LOCAL MESSAGE OBJECT
+ * ============================================================
+ */
+
+function locallyEditedMessage(message: any) {
+    const edit = getEdit(message);
+
+    if (edit === undefined) {
+        return message;
+    }
+
+    return {
+        ...message,
+        content: edit,
+    };
+}
+
+
+/* ============================================================
+ * DISPATCH LOCAL UPDATE
+ * ============================================================
+ */
+
+function refreshMessage(message: any) {
+    const Dispatcher =
+        revenge.discord.common.flux.Dispatcher;
+
+    if (!Dispatcher || !message?.id) {
+        return;
+    }
+
+    const edited = locallyEditedMessage(message);
+
+    Dispatcher.dispatch({
+        type: "MESSAGE_UPDATE",
+
+        message: {
+            ...message,
+
+            /*
+             * Only the local representation is changed.
+             */
+            content: edited.content,
+        },
+    });
+}
+
+
+/* ============================================================
+ * CURRENT USER CHECK
+ * ============================================================
+ */
+
+function isOwnMessage(message: any): boolean {
+    const currentUser =
+        mods.UserStore?.getCurrentUser?.();
+
+    return (
+        !!currentUser?.id &&
+        currentUser.id === message?.author?.id
+    );
+}
+
+
+/* ============================================================
+ * REACT / REACT NATIVE
+ * ============================================================
+ */
+
+function getReactModules() {
+    /*
+     * Revenge Next's exposed Discord modules vary between
+     * releases, so try the common locations.
+     */
+
+    const React =
+        revenge.discord?.common?.React ??
+        revenge.react ??
+        revenge.discord?.common?.react;
+
+    const ReactNative =
+        revenge.discord?.common?.ReactNative ??
+        revenge.reactNative ??
+        revenge.discord?.common?.reactNative;
+
+    return {
+        React,
+        ReactNative,
+    };
+}
+
+
+/* ============================================================
+ * EDIT MODAL
+ * ============================================================
+ */
+
+let modalSetter:
+    | ((value: boolean) => void)
+    | null = null;
+
+let messageSetter:
+    | ((message: any) => void)
+    | null = null;
+
+function openEditor(message: any) {
+    if (!modalSetter || !messageSetter) {
+        console.warn(
+            "[LocalMessageEdit] Editor UI is not mounted",
+        );
+        return;
+    }
+
+    messageSetter(message);
+    modalSetter(true);
+}
+
+
+function EditorModal() {
+    const {
+        React,
+        ReactNative,
+    } = getReactModules();
+
+    if (!React || !ReactNative) {
+        return null;
+    }
+
+    const {
+        View,
+        Text,
+        TextInput,
+        Pressable,
+        Modal,
+        StyleSheet,
+    } = ReactNative;
+
+    const [visible, setVisible] =
+        React.useState(false);
+
+    const [message, setMessage] =
+        React.useState<any>(null);
+
+    const [content, setContent] =
+        React.useState("");
+
+    React.useEffect(() => {
+        modalSetter = setVisible;
+
+        messageSetter = (nextMessage) => {
+            setMessage(nextMessage);
+
+            if (!nextMessage) {
+                setContent("");
+                return;
+            }
+
+            const existing =
+                getEdit(nextMessage);
+
+            setContent(
+                existing ??
+                nextMessage.content ??
+                "",
+            );
+        };
+
+        return () => {
+            modalSetter = null;
+            messageSetter = null;
+        };
+    }, []);
+
+
+    if (!visible || !message) {
+        return null;
+    }
+
+
+    const close = () => {
+        setVisible(false);
+        setMessage(null);
+    };
+
+
+    const save = () => {
+        setEdit(message, content);
+
+        refreshMessage(message);
+
+        close();
+
+        console.log(
+            "[LocalMessageEdit] Saved local edit:",
+            message.id,
+        );
+    };
+
+
+    const clear = () => {
+        clearEdit(message);
+
+        /*
+         * Restore the original server-side content locally.
+         */
+        const Dispatcher =
+            revenge.discord.common.flux.Dispatcher;
+
+        Dispatcher.dispatch({
+            type: "MESSAGE_UPDATE",
+
+            message: {
+                ...message,
+                content: message.content,
+            },
+        });
+
+        close();
+
+        console.log(
+            "[LocalMessageEdit] Cleared local edit:",
+            message.id,
+        );
+    };
+
+
+    const styles = StyleSheet.create({
+        overlay: {
+            flex: 1,
+            justifyContent: "center",
+            alignItems: "center",
+            backgroundColor: "rgba(0,0,0,0.75)",
+        },
+
+        container: {
+            width: "90%",
+            maxWidth: 500,
+            padding: 20,
+            borderRadius: 10,
+            backgroundColor: "#2b2d31",
+        },
+
+        title: {
+            fontSize: 20,
+            fontWeight: "700",
+            color: "#ffffff",
+            marginBottom: 15,
+        },
+
+        input: {
+            minHeight: 120,
+            padding: 12,
+            borderRadius: 6,
+            backgroundColor: "#1e1f22",
+            color: "#ffffff",
+            textAlignVertical: "top",
+        },
+
+        buttons: {
+            flexDirection: "row",
+            marginTop: 15,
+            gap: 8,
+        },
+
+        button: {
+            flex: 1,
+            padding: 12,
+            borderRadius: 6,
+            alignItems: "center",
+        },
+
+        cancel: {
+            backgroundColor: "#4e5058",
+        },
+
+        clear: {
+            backgroundColor: "#da373c",
+        },
+
+        save: {
+            backgroundColor: "#5865f2",
+        },
+
+        buttonText: {
+            color: "#ffffff",
+            fontWeight: "600",
+        },
+    });
+
+
+    return React.createElement(
+        Modal,
+        {
+            visible: true,
+            transparent: true,
+            animationType: "fade",
+            onRequestClose: close,
+        },
+
+        React.createElement(
+            View,
+            {
+                style: styles.overlay,
+            },
+
+            React.createElement(
+                View,
+                {
+                    style: styles.container,
+                },
+
+                React.createElement(
+                    Text,
+                    {
+                        style: styles.title,
+                    },
+                    "Edit Message Locally",
+                ),
+
+                React.createElement(
+                    TextInput,
+                    {
+                        style: styles.input,
+
+                        value: content,
+
+                        onChangeText:
+                            setContent,
+
+                        multiline: true,
+
+                        autoFocus: true,
+
+                        placeholder:
+                            "Enter replacement message...",
+
+                        placeholderTextColor:
+                            "#949ba4",
+                    },
+                ),
+
+                React.createElement(
+                    View,
+                    {
+                        style: styles.buttons,
+                    },
+
+                    React.createElement(
+                        Pressable,
+                        {
+                            style: [
+                                styles.button,
+                                styles.cancel,
+                            ],
+
+                            onPress: close,
+                        },
+
+                        React.createElement(
+                            Text,
+                            {
+                                style:
+                                    styles.buttonText,
+                            },
+                            "Cancel",
+                        ),
+                    ),
+
+                    hasEdit(message) &&
+                        React.createElement(
+                            Pressable,
+                            {
+                                style: [
+                                    styles.button,
+                                    styles.clear,
+                                ],
+
+                                onPress: clear,
+                            },
+
+                            React.createElement(
+                                Text,
+                                {
+                                    style:
+                                        styles.buttonText,
+                                },
+                                "Clear",
+                            ),
+                        ),
+
+                    React.createElement(
+                        Pressable,
+                        {
+                            style: [
+                                styles.button,
+                                styles.save,
+                            ],
+
+                            onPress: save,
+                        },
+
+                        React.createElement(
+                            Text,
+                            {
+                                style:
+                                    styles.buttonText,
+                            },
+                            "Save",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    );
+}
+
+
+/* ============================================================
+ * FIND MESSAGE FROM ACTION SHEET
+ * ============================================================
+ */
+
+function getMessageFromActionSheet(
+    args: any[],
+): any | null {
+    for (const arg of args) {
+        if (!arg) continue;
+
+        if (arg.message) {
+            return arg.message;
+        }
+
+        if (
+            arg.props?.message
+        ) {
+            return arg.props.message;
+        }
+    }
+
+    return null;
+}
+
+
+/* ============================================================
+ * ACTION SHEET PATCH
+ * ============================================================
+ */
+
+function patchMessageActionSheet(
+    cleanup: (fn: () => void) => void,
+) {
+    const ActionSheet =
+        mods.ActionSheet;
+
+    if (
+        !ActionSheet?.openLazy
+    ) {
+        console.warn(
+            "[LocalMessageEdit] ActionSheet not found",
+        );
+
+        return;
+    }
+
+
+    const unpatch =
+        patcher.before(
+            ActionSheet,
+            "openLazy",
+            (args: any[]) => {
+                /*
+                 * Discord's message long-press action sheet
+                 * currently uses MessageLongPressActionSheet.
+                 */
+
+                const key =
+                    args?.[1];
+
+                if (
+                    key !==
+                    "MessageLongPressActionSheet"
+                ) {
+                    return;
+                }
+
+
+                const message =
+                    getMessageFromActionSheet(
+                        args,
+                    );
+
+                if (!message) {
+                    return;
+                }
+
+
+                /*
+                 * Don't offer local editing on
+                 * your own messages.
+                 */
+
+                if (
+                    isOwnMessage(message)
+                ) {
+                    return;
+                }
+
+
+                /*
+                 * The actual action-sheet component
+                 * is loaded asynchronously.
+                 */
+
+                const component =
+                    args?.[0];
+
+                if (
+                    !component?.then
+                ) {
+                    return;
+                }
+
+
+                component.then(
+                    (module: any) => {
+                        patchLoadedActionSheet(
+                            module,
+                            message,
+                        );
+                    },
+                );
+            },
+        );
+
+    cleanup(unpatch);
+}
+
+
+/* ============================================================
+ * PATCH LOADED ACTION SHEET
+ * ============================================================
+ */
+
+function patchLoadedActionSheet(
+    module: any,
+    message: any,
+) {
+    const {
+        React,
+        ReactNative,
+    } = getReactModules();
+
+    if (!React || !ReactNative) {
+        return;
+    }
+
+    /*
+     * Find the default exported React component.
+     */
+
+    const component =
+        module?.default;
+
+    if (!component) {
+        return;
+    }
+
+
+    /*
+     * Patch the component's output.
+     */
+
+    const unpatch =
+        patcher.after(
+            component,
+            "default",
+            (
+                _args: any[],
+                tree: any,
+            ) => {
+                try {
+                    addLocalEditButton(
+                        tree,
+                        message,
+                    );
+                } catch (error) {
+                    console.error(
+                        "[LocalMessageEdit] Failed to add button:",
+                        error,
+                    );
+                }
+
+                return tree;
+            },
+        );
+
+
+    /*
+     * The component only lives for the action sheet,
+     * so its patch can safely be removed shortly after.
+     */
+
+    setTimeout(() => {
+        try {
+            unpatch();
+        } catch {}
+    }, 1000);
+}
+
+
+/* ============================================================
+ * FIND ACTION SHEET BUTTON ARRAY
+ * ============================================================
+ */
+
+function findButtonArray(
+    tree: any,
+): any[] | null {
+    if (!tree) {
+        return null;
+    }
+
+    if (Array.isArray(tree)) {
+        /*
+         * Look for an array containing action-sheet rows.
+         */
+
+        const looksLikeButtons =
+            tree.some(
+                (item) =>
+                    item?.props?.label ||
+                    item?.props?.onPress,
+            );
+
+        if (looksLikeButtons) {
+            return tree;
+        }
+
+        for (const item of tree) {
+            const result =
+                findButtonArray(item);
+
+            if (result) {
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    if (
+        typeof tree === "object"
+    ) {
+        for (
+            const value of Object.values(tree)
+        ) {
+            const result =
+                findButtonArray(value);
+
+            if (result) {
+                return result;
+            }
+        }
+    }
+
+    return null;
+}
+
+
+/* ============================================================
+ * INSERT LOCAL EDIT BUTTON
+ * ============================================================
+ */
+
+function addLocalEditButton(
+    tree: any,
+    message: any,
+) {
+    const buttons =
+        findButtonArray(tree);
+
+    if (!buttons) {
+        return;
+    }
+
+
+    /*
+     * Prevent duplicates.
+     */
+
+    const alreadyExists =
+        buttons.some(
+            (button) =>
+                button?.props?.label ===
+                "Edit Locally",
+        );
+
+    if (alreadyExists) {
+        return;
+    }
+
+
+    const {
+        React,
+        ReactNative,
+    } = getReactModules();
+
+    if (!React || !ReactNative) {
+        return;
+    }
+
+
+    const ActionSheetRow =
+        mods.ActionSheetRow;
+
+
+    /*
+     * If Discord's current ActionSheetRow
+     * module is available, use it.
+     */
+
+    if (ActionSheetRow) {
+        const button =
+            React.createElement(
+                ActionSheetRow,
+                {
+                    label:
+                        hasEdit(message)
+                            ? "Edit Locally ✏️"
+                            : "Edit Locally",
+
+                    onPress: () => {
+                        mods.ActionSheet
+                            ?.hideActionSheet?.();
+
+                        openEditor(message);
+                    },
+                },
+            );
+
+        buttons.push(button);
+
+        return;
+    }
+
+
+    /*
+     * Fallback for builds where ActionSheetRow
+     * isn't exposed.
+     */
+
+    const Pressable =
+        ReactNative.Pressable;
+
+    const Text =
+        ReactNative.Text;
+
+    const button =
+        React.createElement(
+            Pressable,
+            {
+                onPress: () => {
+                    mods.ActionSheet
+                        ?.hideActionSheet?.();
+
+                    openEditor(message);
+                },
+
+                style: {
+                    padding: 15,
+                },
+            },
+
+            React.createElement(
+                Text,
+                {
+                    style: {
+                        color: "#ffffff",
+                    },
+                },
+
+                hasEdit(message)
+                    ? "Edit Locally ✏️"
+                    : "Edit Locally",
+            ),
+        );
+
+    buttons.push(button);
+}
+
+
+/* ============================================================
+ * MESSAGE STORE PATCH
+ * ============================================================
+ *
+ * This is important.
+ *
+ * Without this, opening another channel or having Discord
+ * reload its MessageStore can make the original server
+ * message appear again.
+ *
+ * We therefore intercept locally retrieved messages and
+ * substitute our local content.
+ */
+
+function patchMessageStore(
+    cleanup: (fn: () => void) => void,
+) {
+    const MessageStore =
+        mods.MessageStore;
+
+    if (!MessageStore) {
+        return;
+    }
+
+
+    if (
+        typeof MessageStore.getMessage ===
+        "function"
+    ) {
+        const unpatch =
+            patcher.after(
+                MessageStore,
+                "getMessage",
+                (
+                    _args: any[],
+                    result: any,
+                ) => {
+                    if (!result) {
+                        return result;
+                    }
+
+                    return locallyEditedMessage(
+                        result,
+                    );
+                },
+            );
+
+        cleanup(unpatch);
+    }
+
+
+    if (
+        typeof MessageStore.getMessages ===
+        "function"
+    ) {
+        const unpatch =
+            patcher.after(
+                MessageStore,
+                "getMessages",
+                (
+                    _args: any[],
+                    result: any,
+                ) => {
+                    if (!result) {
+                        return result;
+                    }
+
+
+                    if (
+                        Array.isArray(result)
+                    ) {
+                        return result.map(
+                            locallyEditedMessage,
+                        );
+                    }
+
+
+                    if (
+                        typeof result.toArray ===
+                        "function"
+                    ) {
+                        const array =
+                            result.toArray();
+
+                        return array.map(
+                            locallyEditedMessage,
+                        );
+                    }
+
+
+                    return result;
+                },
+            );
+
+        cleanup(unpatch);
+    }
+}
+
+
+/* ============================================================
+ * PLUGIN
+ * ============================================================
+ */
 
 export default plugin({
-	async start({ cleanup, plugin }) {
-		const { Dispatcher } = revenge.discord.common.flux;
-		mods = {};
-		let ready = false;
+    start({ cleanup }) {
+        console.log(
+            "[LocalMessageEdit] Starting...",
+        );
 
-		function setup() {
-			if (ready) return true;
 
-			const [UserStore] = lookupModule(filters.withProps("getUser", "getCurrentUser"));
-			const [RestAPI] = lookupModule(filters.withProps("getAPIBaseURL", "get", "post"));
-			if (!UserStore || !RestAPI) return false;
-			ready = true;
+        /*
+         * Try to locate the modules immediately.
+         */
 
-			const isCached = (id) => !!UserStore.getUser?.(id);
+        if (!findModules()) {
+            console.warn(
+                "[LocalMessageEdit] Required modules aren't loaded yet.",
+            );
 
-			async function refreshMessageUI(channelId, msg) {
-				const embeds = msg.embeds;
-				const components = msg.components;
+            /*
+             * Wait for MessageStore.
+             */
 
-				Dispatcher.dispatch({
-					type: "MESSAGE_UPDATE",
-					message: { id: msg.id, channel_id: channelId, content: msg.content ? `${msg.content}\u200b ` : " ", embeds },
-				});
-				await sleep(110);
+            const stop =
+                waitForModules(
+                    filters.withProps(
+                        "getMessages",
+                    ),
 
-				if (isComponentsV2(msg.flags)) {
-					Dispatcher.dispatch({
-						type: "MESSAGE_UPDATE",
-						message: {
-							id: msg.id,
-							channel_id: channelId,
-							components: components?.length ? bustComponentsCache(components) : components,
-							flags: msg.flags,
-						},
-					});
-				} else {
-					Dispatcher.dispatch({
-						type: "MESSAGE_UPDATE",
-						message: {
-							id: msg.id,
-							channel_id: channelId,
-							content: msg.content,
-							attachments: msg.attachments,
-							embeds: embeds?.length ? embeds.map(toRawEmbed) : embeds,
-							components,
-						},
-					});
-				}
-			}
+                    () => {
+                        findModules();
 
-			async function fetchViaGateway(userIds) {
-				const guildId = mods.SelectedGuildStore?.getGuildId?.();
-				const ws = mods.GatewayConnection?.getGateway?.();
-				if (!guildId || !ws) return false;
-				try {
-					ws.send(GATEWAY_OP_REQUEST_MEMBERS, { guild_id: [guildId], limit: 100, user_ids: userIds, presences: true });
-				} catch (err) {
-					console.error("[ValidUser] gateway send failed", err);
-					return false;
-				}
-				await sleep(400);
-				return true;
-			}
+                        patchMessageStore(
+                            cleanup,
+                        );
 
-			async function fetchUser(userId) {
-				if (isCached(userId)) return;
+                        patchMessageActionSheet(
+                            cleanup,
+                        );
 
-				if (typeof mods.UserUtils?.fetchUser === "function") {
-					try {
-						await mods.UserUtils.fetchUser(userId);
-						return;
-					} catch {}
-				}
+                        stop();
+                    },
+                );
 
-				try {
-					const res = await RestAPI.get({ url: `/users/${userId}` });
-					if (res.status === 200 && res.body) Dispatcher.dispatch({ type: "USER_UPDATE", user: res.body });
-				} catch (err) {
-					if (err?.status === 404 || err?.body?.code === 10013) {
-						Dispatcher.dispatch({ type: "USER_UPDATE", user: deletedUserPayload(userId) });
-					} else {
-						console.error(`[ValidUser] fetch failed for ${userId}`, err);
-					}
-				}
-			}
+            cleanup(stop);
 
-			async function fixMentions(message) {
-				const ids = allMentionIds(message, isCached);
-				if (ids.length === 0) return;
+            return;
+        }
 
-				const uncached = ids.filter((id) => !isCached(id));
-				if (uncached.length > 0) {
-					const viaGateway = uncached.length > BULK_FETCH_THRESHOLD && (await fetchViaGateway(uncached));
-					if (!viaGateway) {
-						const delay = uncached.length > 10 ? 800 : 200;
-						for (let i = 0; i < uncached.length; i++) {
-							await fetchUser(uncached[i]);
-							if (i < uncached.length - 1) await sleep(delay);
-						}
-					}
-				}
 
-				await sleep(200);
-				const channelId = message.channelId || message.channel_id;
-				if (channelId && message.id) await refreshMessageUI(channelId, message);
-			}
+        /*
+         * Patch message retrieval.
+         */
 
-			const seen = new Set();
+        patchMessageStore(
+            cleanup,
+        );
 
-			function maybeFix(message) {
-				if (!message?.id || seen.has(message.id)) return;
-				if (allMentionIds(message, isCached).length === 0) return;
-				seen.add(message.id);
-				fixMentions(message).catch((err) => console.error(`[ValidUser] auto-fix failed for ${message.id}`, err));
-			}
 
-			function sweepChannel(channelId) {
-				if (!channelId || !mods.MessageStore?.getMessages) return;
-				try {
-					const messages = mods.MessageStore.getMessages(channelId);
-					const list = typeof messages?.toArray === "function" ? messages.toArray() : messages ?? [];
-					for (const msg of list) maybeFix(msg);
-				} catch (err) {
-					console.error(`[ValidUser] channel sweep failed for ${channelId}`, err);
-				}
-			}
+        /*
+         * Patch the long-press action sheet.
+         */
 
-			const onMessageCreate = (payload) => payload?.message && maybeFix(payload.message);
-			const onLoadMessages = (payload) => payload?.messages?.forEach(maybeFix);
-			const onChannelSelect = (payload) => sweepChannel(payload?.channelId);
+        patchMessageActionSheet(
+            cleanup,
+        );
 
-			Dispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
-			Dispatcher.subscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages);
-			Dispatcher.subscribe("CHANNEL_SELECT", onChannelSelect);
-			cleanup(
-				() => Dispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate),
-				() => Dispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", onLoadMessages),
-				() => Dispatcher.unsubscribe("CHANNEL_SELECT", onChannelSelect),
-			);
 
-			resolve(cleanup, "GatewayConnection", filters.withProps("getGateway", "send"));
-			resolve(cleanup, "UserUtils", filters.withProps("fetchProfile", "getUser", "fetchUser"));
-			resolve(cleanup, "MessageStore", filters.withProps("getMessages"), () => sweepChannel(mods.SelectedGuildStore?.getChannelId?.()));
-			resolve(cleanup, "SelectedGuildStore", filters.withProps("getGuildId", "getChannelId"), (s) => sweepChannel(s?.getChannelId?.()));
+        /*
+         * Mount the editor UI.
+         *
+         * The exact mount mechanism depends on the
+         * React root exposed by the current Revenge Next
+         * version.
+         */
 
-			resolve(cleanup, "AvatarUtils", filters.withProps("getDefaultAvatarURL", "getUserAvatarURL"), (AvatarUtils) => {
-				if (!AvatarUtils?.getDefaultAvatarURL) return;
-				cleanup(
-					patcher.instead(AvatarUtils, "getDefaultAvatarURL", (args, orig) => {
-						try {
-							const [id] = args;
-							if (typeof id === "string" || typeof id === "number" || id == null) return orig(...args);
-							return orig(String(id.id ?? "0"), typeof id.discriminator === "string" ? id.discriminator : "0000");
-						} catch (err) {
-							console.error("[ValidUser] getDefaultAvatarURL crash intercepted", err);
-							return orig("0", "0000");
-						}
-					}),
-				);
-			});
+        mountEditorUI(
+            cleanup,
+        );
 
-			return true;
-		}
 
-		if (!setup()) {
-			const stops = [];
-			const retry = () => setup() && stops.forEach((stop) => stop());
-			stops.push(waitForModules(filters.withProps("getUser", "getCurrentUser"), retry));
-			stops.push(waitForModules(filters.withProps("getAPIBaseURL", "get", "post"), retry));
-			cleanup(...stops);
-		}
-
-		if (plugin.startedLate) plugin.requireReload();
-	},
+        console.log(
+            "[LocalMessageEdit] Started.",
+        );
+    },
 });
+
+
+/* ============================================================
+ * EDITOR UI MOUNT
+ * ============================================================
+ */
+
+function mountEditorUI(
+    cleanup: (fn: () => void) => void,
+) {
+    /*
+     * Revenge Next versions expose their React tree
+     * differently.
+     *
+     * We first try to find an application/root component.
+     */
+
+    const [RootComponent] =
+        lookupModule(
+            filters.withProps(
+                "render",
+            ),
+        );
+
+    if (!RootComponent) {
+        console.warn(
+            "[LocalMessageEdit] React root not found.",
+        );
+
+        return;
+    }
+
+
+    const {
+        React,
+    } = getReactModules();
+
+    if (!React) {
+        return;
+    }
+
+
+    /*
+     * Patch the root render and append our modal.
+     */
+
+    if (
+        typeof RootComponent.render !==
+        "function"
+    ) {
+        return;
+    }
+
+
+    const unpatch =
+        patcher.after(
+            RootComponent,
+            "render",
+            (
+                _args: any[],
+                tree: any,
+            ) => {
+                try {
+                    /*
+                     * The modal manages its own visibility,
+                     * so it can safely remain mounted.
+                     */
+
+                    if (
+                        Array.isArray(tree)
+                    ) {
+                        tree.push(
+                            React.createElement(
+                                EditorModal,
+                                {
+                                    key:
+                                        "local-message-edit-modal",
+                                },
+                            ),
+                        );
+                    }
+                } catch (error) {
+                    console.error(
+                        "[LocalMessageEdit] UI mount failed:",
+                        error,
+                    );
+                }
+
+                return tree;
+            },
+        );
+
+
+    cleanup(unpatch);
+}
