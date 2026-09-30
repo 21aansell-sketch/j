@@ -1,0 +1,14 @@
+{
+	"format": 1,
+	"id": "k1ngop.last-online-tracker",
+	"name": "LastOnlineTracker",
+	"description": "Shows 'Active X ago' under usernames in the member list, DM list, and DM header once they go offline",
+	"icon": "HourglassIcon",
+	"author": "k1ng_op",
+	"version": "2.4.3",
+	"dependencies": {
+		"revenge.api": { "version": ">=1 <2" },
+		"discord": { "version": "*" }
+	},
+	"dist": { "script": "index.js" }
+}
